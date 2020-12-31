@@ -2,6 +2,10 @@
 package main
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -10,18 +14,78 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
 	"github.com/gofiber/fiber/v2"
+
+	// implement hashing
+	"golang.org/x/crypto/bcrypt"
 )
 
+var (
+	AESKey string = os.Getenv("AES_ENCRYPTION_SYM_KEY")
+)
 // Record Value struct
 type RecordValue struct {
 	Value string `json:"value" xml:"value" form:"value"`
 }
+// encrypt
+func encryptValue(val string) (string, error) {
+	c, err := aes.NewCipher([]byte(AESKey))
+	if err != nil {
+		return "", err
+	}
+	gcm, err := cipher.NewGCM(c)
+	if err != nil {
+		return "", err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err = io.ReadFull(rand.Reader, nonce); err != nil {
+		return "", err
+	}
+	return string(gcm.Seal(nonce, nonce, []byte(val), nil)), nil
+}
+// decrypt
+func decryptValue(val string) (string, error) {
+	ciphertext := []byte(val)
+	c, err := aes.NewCipher([]byte(AESKey))
+	if err != nil {
+		return "", err
+	}
 
+	gcm, err := cipher.NewGCM(c)
+	if err != nil {
+		return "", nil
+	}
+	nonceSize := gcm.NonceSize()
+    if len(ciphertext) < nonceSize {
+		return "", nil
+    }
+	nonce, ciphertext := ciphertext[:nonceSize], ciphertext[nonceSize:]
+	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
+    if err != nil {
+		return "", nil
+	}
+	return string(plaintext), nil
+}
+// hash the key
+func hashKey(val string) (string, error) {
+	res, err := bcrypt.GenerateFromPassword([]byte(val), 10)
+	return string(res), err
+}
 func modifyDNS(action string, c *fiber.Ctx) error {
+	// encrypt the value
+	
+	// hashes the key
+	TokenHash, err := hashKey(c.Params("token"))
+	if err != nil {
+		return err
+	}
 	// create new var to extract stuff
 	valueSet := new(RecordValue)
 	// parse body
 	if err := c.BodyParser(valueSet); err != nil {
+		return err
+	}
+	EncryptedValue, err := encryptValue(valueSet.Value)
+	if err != nil {
 		return err
 	}
 	// get required initial val
@@ -40,11 +104,11 @@ func modifyDNS(action string, c *fiber.Ctx) error {
 					Action: aws.String(action),
 					// the record itself is a TXT record
 					ResourceRecordSet: &route53.ResourceRecordSet{
-						Name: aws.String(c.Params("token") + "." + os.Getenv("BASE_DOMAIN")),
+						Name: aws.String(TokenHash + "." + os.Getenv("BASE_DOMAIN")),
 						Type: aws.String("TXT"),
 						ResourceRecords: []*route53.ResourceRecord{
 							{
-								Value: aws.String(valueSet.Value),
+								Value: aws.String(EncryptedValue),
 							},
 						},
 						TTL:    aws.Int64(10),
@@ -78,6 +142,7 @@ func main() {
 		if err != nil {
 			return err
 		}
+		decryptValue(res[0])
 		return c.SendString(res[0])
 	})
 
